@@ -125,7 +125,10 @@ secrets:
       # ideally this is not stored here in the clear but a safe secret backend is used to store/fetch from.
       # the example server's keychain (secret.Resolver) also supports:
       #   group: env   key: TACQUITO_PSK          -> read PSK from an environment variable
-      #   group: file  key: /run/secrets/tq_psk   -> read PSK from a file (trailing newline trimmed)
+      #   group: file  key: /run/secrets/tq_psk   -> read PSK from a file
+      # for env and file, put one key per line to rotate: the first line is the
+      # primary key, later lines are older keys still accepted. both are re-read
+      # on every connection, so no reload is needed. see secret.Resolver.
       # any other group uses key verbatim as the PSK, as below.
       key: fooman
     # Handler - this must be injected in main.go

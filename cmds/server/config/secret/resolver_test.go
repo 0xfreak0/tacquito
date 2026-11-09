@@ -81,3 +81,58 @@ func TestResolverFileRotation(t *testing.T) {
 		t.Fatalf("got %q, want two", got)
 	}
 }
+
+// TestResolverAddAll covers the multi-key form used for rotation: one key per
+// line, first line is the primary key.
+func TestResolverAddAll(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	t.Setenv("TQ_TEST_PSKS", "new\nold")
+
+	tests := []struct {
+		name    string
+		kc      config.Keychain
+		want    []string
+		wantErr bool
+	}{
+		{name: "env multiple", kc: config.Keychain{Group: GroupEnv, Key: "TQ_TEST_PSKS"}, want: []string{"new", "old"}},
+		{name: "file multiple", kc: config.Keychain{Group: GroupFile, Key: write("two", "new\nold\n")}, want: []string{"new", "old"}},
+		{name: "file crlf and blank lines", kc: config.Keychain{Group: GroupFile, Key: write("crlf", "\r\nnew\r\n\r\nold\r\n")}, want: []string{"new", "old"}},
+		{name: "file single", kc: config.Keychain{Group: GroupFile, Key: write("one", "only\n")}, want: []string{"only"}},
+		{name: "file only blank lines", kc: config.Keychain{Group: GroupFile, Key: write("blank", "\n\r\n")}, wantErr: true},
+		{name: "plaintext is one key", kc: config.Keychain{Group: "tacquito", Key: "fooman"}, want: []string{"fooman"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := NewResolver().AddAll(tc.kc)(context.Background(), "192.0.2.1")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+			for i := range got {
+				if string(got[i]) != tc.want[i] {
+					t.Fatalf("got %q, want %q", got, tc.want)
+				}
+			}
+			// Add must return the primary key for single-key callers
+			first, err := NewResolver().Add(tc.kc)(context.Background(), "192.0.2.1")
+			if err != nil || string(first) != tc.want[0] {
+				t.Fatalf("Add got %q, %v; want %q", first, err, tc.want[0])
+			}
+		})
+	}
+}

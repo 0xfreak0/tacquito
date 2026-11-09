@@ -32,6 +32,14 @@ type keychainProvider interface {
 	Add(k config.Keychain) func(context.Context, string) ([]byte, error)
 }
 
+// multiKeychainProvider is an optional extension of keychainProvider for PSK
+// rotation: AddAll's func returns every accepted key, primary first. It is
+// only used when the scope's secretProviderFactory also implements
+// multiSecretProviderFactory.
+type multiKeychainProvider interface {
+	AddAll(k config.Keychain) func(context.Context, string) ([][]byte, error)
+}
+
 // providerFactory creates scoped user config providers for each secret provider
 type providerFactory interface {
 	New(users map[string]*config.AAA) config.Provider
@@ -40,6 +48,12 @@ type providerFactory interface {
 // secretProviderFactory provides a new tq.SecretProvider
 type secretProviderFactory interface {
 	New(ctx context.Context, sc config.SecretConfig, h tq.Handler, secret func(context.Context, string) ([]byte, error)) tq.SecretProvider
+}
+
+// multiSecretProviderFactory is an optional extension of secretProviderFactory
+// that accepts a multi-key secrets func; see multiKeychainProvider.
+type multiSecretProviderFactory interface {
+	NewMulti(ctx context.Context, sc config.SecretConfig, h tq.Handler, secrets func(context.Context, string) ([][]byte, error)) tq.SecretProvider
 }
 
 // handlerFactory provides new handler types
@@ -196,28 +210,45 @@ func (l Loader) BlockUntilLoaded() {
 	}
 }
 
-// Get implements tq.SecretProvider.  The underlying user types and associated configs
-// are protected by this method.
+// Get implements tq.SecretProvider, returning only the primary key.  The
+// underlying user types and associated configs are protected by this method.
 func (l Loader) Get(ctx context.Context, remote net.Addr) ([]byte, tq.Handler, error) {
+	return tq.PrimarySecret(l.GetSecrets(ctx, remote))
+}
+
+// GetSecrets implements tq.MultiSecretProvider, returning every key accepted
+// for remote, primary first. Scopes without multi-key support yield one key.
+func (l Loader) GetSecrets(ctx context.Context, remote net.Addr) ([][]byte, tq.Handler, error) {
 	q := queryGet{ctx: ctx, remote: remote, cb: make(chan secretProvider)}
 	l.query <- q
 	secretProviderGet.Inc()
 	sp := <-q.cb
 	secretProviderGet.Dec()
-	return sp.secret, sp.handler, sp.err
+	return sp.secrets, sp.handler, sp.err
 }
 
 // get is a protected method that searches for a matching provider.  we first check the
 // remote connection should even be allowed.
-func (l Loader) get(ctx context.Context, providers []tq.SecretProvider, remote net.Addr) ([]byte, tq.Handler, error) {
+func (l Loader) get(ctx context.Context, providers []tq.SecretProvider, remote net.Addr) ([][]byte, tq.Handler, error) {
 	for _, sp := range providers {
-		secret, handler, err := sp.Get(ctx, remote)
-		if err != nil || secret == nil || handler == nil {
+		var secrets [][]byte
+		var handler tq.Handler
+		var err error
+		if msp, ok := sp.(tq.MultiSecretProvider); ok {
+			secrets, handler, err = msp.GetSecrets(ctx, remote)
+		} else {
+			var secret []byte
+			secret, handler, err = sp.Get(ctx, remote)
+			if secret != nil {
+				secrets = [][]byte{secret}
+			}
+		}
+		if err != nil || len(secrets) == 0 || secrets[0] == nil || handler == nil {
 			l.Debugf(ctx, "remote [%v], %v", remote, err)
 			continue
 		}
 		secretKnown.Inc()
-		return secret, handler, err
+		return secrets, handler, err
 	}
 	secretUnknown.Inc()
 	return nil, nil, fmt.Errorf("remote [%v] has no secret providers", remote)
@@ -259,8 +290,8 @@ func (l *Loader) updates() {
 					close(q.cb)
 					return
 				}
-				secret, handler, err := l.get(q.ctx, providers, q.remote)
-				q.cb <- secretProvider{secret: secret, handler: handler, err: err}
+				secrets, handler, err := l.get(q.ctx, providers, q.remote)
+				q.cb <- secretProvider{secrets: secrets, handler: handler, err: err}
 				close(q.cb)
 				buildGet.Inc()
 			}()
@@ -290,7 +321,7 @@ func strToIPNet(prefixes []string) []*net.IPNet {
 }
 
 type secretProvider struct {
-	secret  []byte
+	secrets [][]byte
 	handler tq.Handler
 	err     error
 }
@@ -391,8 +422,18 @@ func (l Loader) build(c config.ServerConfig) []tq.SecretProvider {
 			secretProviderMissing.Inc()
 			continue
 		}
-		secretFunc := l.keychainProvider.Add(provider.Secret)
-		p := providerType.New(l.ctx, provider, handler, secretFunc)
+		var p tq.SecretProvider
+		mk, multiKeychain := l.keychainProvider.(multiKeychainProvider)
+		mf, multiFactory := providerType.(multiSecretProviderFactory)
+		switch {
+		case multiKeychain && multiFactory:
+			p = mf.NewMulti(l.ctx, provider, handler, mk.AddAll(provider.Secret))
+		case multiKeychain:
+			l.Infof(l.ctx, "secret provider type [%v] in scope [%v] does not support multiple keys; only the primary key will be accepted", provider.Type, provider.Name)
+			fallthrough
+		default:
+			p = providerType.New(l.ctx, provider, handler, l.keychainProvider.Add(provider.Secret))
+		}
 		if p == nil {
 			l.Errorf(l.ctx, "provider factory is nil in scope [%v]; no users will be added", provider.Name)
 			providerFactoryMissing.Inc()

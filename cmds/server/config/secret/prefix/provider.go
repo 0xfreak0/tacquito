@@ -67,8 +67,15 @@ type Provider struct {
 	secrets map[string]secretConfig
 }
 
-// New returns a scoped Provider for a given set of users.
+// New returns a scoped Provider for a given set of users, with a single
+// pre-shared key.
 func (p *Provider) New(ctx context.Context, provider config.SecretConfig, handler tq.Handler, secret func(context.Context, string) ([]byte, error)) tq.SecretProvider {
+	return p.NewMulti(ctx, provider, handler, tq.SingleSecret(secret))
+}
+
+// NewMulti returns a scoped Provider whose secrets func may return several
+// pre-shared keys, primary first, for rotation. See tq.MultiSecretProvider.
+func (p *Provider) NewMulti(ctx context.Context, provider config.SecretConfig, handler tq.Handler, secrets func(context.Context, string) ([][]byte, error)) tq.SecretProvider {
 	var prefixes []string
 	raw := provider.Options["prefixes"]
 	if err := json.Unmarshal([]byte(raw), &prefixes); err != nil {
@@ -80,7 +87,7 @@ func (p *Provider) New(ctx context.Context, provider config.SecretConfig, handle
 		return nil
 	}
 	scopedConfig := secretConfig{
-		secret:  secret,
+		secrets: secrets,
 		Handler: handler,
 	}
 	return New(
@@ -89,8 +96,13 @@ func (p *Provider) New(ctx context.Context, provider config.SecretConfig, handle
 	)
 }
 
-// Get returns a tq SecretProvider interface and or error
+// Get returns the primary pre-shared key and handler for remote.
 func (p *Provider) Get(ctx context.Context, remote net.Addr) ([]byte, tq.Handler, error) {
+	return tq.PrimarySecret(p.GetSecrets(ctx, remote))
+}
+
+// GetSecrets implements tq.MultiSecretProvider.
+func (p *Provider) GetSecrets(ctx context.Context, remote net.Addr) ([][]byte, tq.Handler, error) {
 	addr, ok := remote.(*net.TCPAddr)
 	if !ok {
 		return nil, nil, fmt.Errorf("unable to assert [%v] is net.TCPAddr", remote)
@@ -103,8 +115,8 @@ func (p *Provider) Get(ctx context.Context, remote net.Addr) ([]byte, tq.Handler
 		}
 		if ipNet.Contains(addr.IP) {
 			p.Debugf(ctx, "prefix secret provider matches remote [%v] against prefix [%v]", addr.IP.String(), cidr)
-			secret, err := c.secret(ctx, addr.IP.String())
-			return secret, c, err
+			secrets, err := c.secrets(ctx, addr.IP.String())
+			return secrets, c, err
 		}
 	}
 	return nil, nil, fmt.Errorf("no matching prefix secret provider found")
@@ -112,8 +124,8 @@ func (p *Provider) Get(ctx context.Context, remote net.Addr) ([]byte, tq.Handler
 
 // secretConfig holds the secret config needed for the SecretProvider
 type secretConfig struct {
-	// Secret is applied when performing crypt/obfuscation ops
-	secret func(context.Context, string) ([]byte, error)
+	// secrets are applied when performing crypt/obfuscation ops, primary first
+	secrets func(context.Context, string) ([][]byte, error)
 	// Handler embeds our Handler interface scoped to this SecretConfig
 	tq.Handler
 }

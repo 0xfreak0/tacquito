@@ -124,8 +124,8 @@ func (s *Server) serve(ctx context.Context, conn net.Conn) {
 	defer timer.ObserveDuration()
 	// start a timer to measure loader duration
 	loaderStart := time.Now()
-	secret, handler, err := s.Get(ctx, conn.RemoteAddr())
-	if err != nil || secret == nil || handler == nil {
+	secrets, handler, err := getSecrets(ctx, s.SecretProvider, conn.RemoteAddr())
+	if err != nil {
 		s.Errorf(ctx, "ignoring request: %v", err)
 		conn.Close()
 		timer.ObserveDuration()
@@ -133,7 +133,7 @@ func (s *Server) serve(ctx context.Context, conn net.Conn) {
 	}
 	ctx = context.WithValue(ctx, ContextLoaderDuration, time.Since(loaderStart).Milliseconds())
 	serveAccepted.Inc()
-	s.handle(ctx, newCrypter(secret, conn, s.proxy, s.useTLS), handler)
+	s.handle(ctx, newMultiCrypter(secrets, conn, s.proxy, s.useTLS), handler)
 	serveAccepted.Dec()
 }
 
@@ -144,6 +144,9 @@ func (s *Server) handle(ctx context.Context, c *crypter, h Handler) {
 	// scoped to the entire undelrying net.Conn.  this is needed for single-connect
 	sessionProvider := newSessionProvider()
 	defer sessionProvider.close()
+	// loggedSecondary ensures a connection that selected a non-primary key
+	// during rotation is logged once, so stragglers can be found by address.
+	loggedSecondary := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -159,6 +162,10 @@ func (s *Server) handle(ctx context.Context, c *crypter, h Handler) {
 					s.Errorf(ctx, "closing connection, unable to read, %v", err)
 				}
 				return
+			}
+			if !loggedSecondary && c.matched > 0 {
+				loggedSecondary = true
+				s.Infof(ctx, "remote [%v] is using non-primary secret at index [%v]", c.RemoteAddr(), c.matched)
 			}
 			// store basic connection parameters into ctx
 			ctxWithAddr := context.WithValue(ctx, ContextConnRemoteAddr, strip(c.RemoteAddr().String()))
