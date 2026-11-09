@@ -85,7 +85,7 @@ func main() {
 		*configPath,
 		fsnotify.New(ctx, yaml.New(), logger),
 		loader.SetLoggerProvider(logger),
-		loader.SetKeychainProvider(secret.New()),
+		loader.SetKeychainProvider(secret.NewResolver()),
 		loader.SetConfigProvider(config.New()),
 		loader.SetAuthorizerProvider(stringy.New(logger)),
 		loader.RegisterSecretProviderType(config.PREFIX, prefix.New(logger)),
