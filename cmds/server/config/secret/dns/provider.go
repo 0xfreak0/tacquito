@@ -60,8 +60,15 @@ type Provider struct {
 	secrets map[string]secretConfig
 }
 
-// New returns a scoped Provider for a given set of users.
+// New returns a scoped Provider for a given set of users, with a single
+// pre-shared key.
 func (p *Provider) New(ctx context.Context, provider config.SecretConfig, handler tq.Handler, secret func(context.Context, string) ([]byte, error)) tq.SecretProvider {
+	return p.NewMulti(ctx, provider, handler, tq.SingleSecret(secret))
+}
+
+// NewMulti returns a scoped Provider whose secrets func may return several
+// pre-shared keys, primary first, for rotation. See tq.MultiSecretProvider.
+func (p *Provider) NewMulti(ctx context.Context, provider config.SecretConfig, handler tq.Handler, secrets func(context.Context, string) ([][]byte, error)) tq.SecretProvider {
 	var hosts []string
 	err := json.Unmarshal([]byte(provider.Options["hosts"]), &hosts)
 	if err != nil {
@@ -74,7 +81,7 @@ func (p *Provider) New(ctx context.Context, provider config.SecretConfig, handle
 	}
 
 	scopedConfig := secretConfig{
-		secret:  secret,
+		secrets: secrets,
 		Handler: handler,
 	}
 
@@ -84,8 +91,13 @@ func (p *Provider) New(ctx context.Context, provider config.SecretConfig, handle
 	)
 }
 
-// Get returns a tq SecretProvider interface and or error
+// Get returns the primary pre-shared key and handler for remote.
 func (p *Provider) Get(ctx context.Context, remote net.Addr) ([]byte, tq.Handler, error) {
+	return tq.PrimarySecret(p.GetSecrets(ctx, remote))
+}
+
+// GetSecrets implements tq.MultiSecretProvider.
+func (p *Provider) GetSecrets(ctx context.Context, remote net.Addr) ([][]byte, tq.Handler, error) {
 	addr, ok := remote.(*net.TCPAddr)
 	if !ok {
 		return nil, nil, fmt.Errorf("unable to assert [%v] is net.TCPAddr", remote)
@@ -105,8 +117,8 @@ func (p *Provider) Get(ctx context.Context, remote net.Addr) ([]byte, tq.Handler
 		if c, ok := p.secrets[name]; ok {
 			dnsGetMatch.Inc()
 			p.Debugf(ctx, "dns secret provider matches remote [%v] against fqdn [%v]", addr.IP.String(), name)
-			secret, err := c.secret(ctx, name)
-			return secret, c, err
+			secrets, err := c.secrets(ctx, name)
+			return secrets, c, err
 		}
 	}
 	return nil, nil, fmt.Errorf("no matching dns secret provider found for names %v, for remote [%v]", names, addr.IP.String())
@@ -114,8 +126,8 @@ func (p *Provider) Get(ctx context.Context, remote net.Addr) ([]byte, tq.Handler
 
 // secretConfig holds the secret config needed for the SecretProvider
 type secretConfig struct {
-	// Secret is applied when performing crypt/obfuscation ops
-	secret func(context.Context, string) ([]byte, error)
+	// secrets are applied when performing crypt/obfuscation ops, primary first
+	secrets func(context.Context, string) ([][]byte, error)
 	// Handler embeds our Handler interface scoped to this SecretConfig
 	tq.Handler
 }

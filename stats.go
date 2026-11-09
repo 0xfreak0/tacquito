@@ -8,6 +8,8 @@
 package tacquito
 
 import (
+	"strconv"
+
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -58,6 +60,14 @@ var (
 		Name:      "crypter_badSecret",
 		Help:      "number of bad secrets",
 	})
+	// crypterSecretMatch counts which candidate key a multi-key connection
+	// selected, by index (0 = primary). During a rotation, once every
+	// non-zero index stops increasing, the older keys can be retired.
+	crypterSecretMatch = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "tacquito",
+		Name:      "crypter_secret_match",
+		Help:      "number of multi-key connections that selected the key at the given index",
+	}, []string{"index"})
 	crypterUnmarshalError = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "tacquito",
 		Name:      "crypter_unmarshal_error",
@@ -135,6 +145,7 @@ func init() {
 	prometheus.MustRegister(crypterWrite)
 	prometheus.MustRegister(crypterWriteError)
 	prometheus.MustRegister(crypterBadSecret)
+	prometheus.MustRegister(crypterSecretMatch)
 	prometheus.MustRegister(crypterUnmarshalError)
 	prometheus.MustRegister(crypterMarshalError)
 	prometheus.MustRegister(crypterCryptError)
@@ -147,4 +158,13 @@ func init() {
 	// durations
 	prometheus.MustRegister(sessionDurations)
 	prometheus.MustRegister(connectionDuration)
+}
+
+// secretIndexLabel bounds the cardinality of the crypterSecretMatch index
+// label; nobody should be rotating through more than a handful of keys.
+func secretIndexLabel(i int) string {
+	if i > 9 {
+		return "10+"
+	}
+	return strconv.Itoa(i)
 }

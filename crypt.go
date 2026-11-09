@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 
 	"github.com/facebookincubator/tacquito/proxy"
 )
@@ -90,7 +91,19 @@ func crypt(secret []byte, p *Packet) error {
 
 // newCrypter makes a new crypter
 func newCrypter(secret []byte, c net.Conn, proxy, tls bool) *crypter {
-	return &crypter{secret: secret, Conn: c, Reader: bufio.NewReaderSize(c, 107), proxy: proxy, tls: tls}
+	return &crypter{secret: secret, Conn: c, Reader: bufio.NewReaderSize(c, 107), proxy: proxy, tls: tls, matched: -1}
+}
+
+// newMultiCrypter makes a crypter that accepts any of secrets, for PSK
+// rotation. secrets[0] is the primary key: it is used for writes until a key
+// is selected and for the bad secret reply when no key matches. With a single
+// secret this is identical to newCrypter. secrets must be non-empty.
+func newMultiCrypter(secrets [][]byte, c net.Conn, proxy, tls bool) *crypter {
+	cr := newCrypter(secrets[0], c, proxy, tls)
+	if len(secrets) > 1 {
+		cr.candidates = secrets
+	}
+	return cr
 }
 
 // crypter wraps the net.Conn and performs reads and writes and crypt ops
@@ -104,6 +117,14 @@ type crypter struct {
 
 	// secret is the tacacs psk used in crypt ops
 	secret []byte
+	// candidates, when non-nil, are the keys still under consideration for
+	// this connection (multi-key rotation). The first obfuscated packet read
+	// selects one into secret and clears candidates, locking the key for the
+	// rest of the connection, including all single-connect sessions.
+	candidates [][]byte
+	// matched is the index into the original candidates of the selected key,
+	// or -1 if no selection was made (single key, or not yet selected).
+	matched int
 	// proxy if set, will strip the ha-proxy style ascii header
 	proxy bool
 
@@ -161,10 +182,15 @@ func (c *crypter) read() (*Packet, error) {
 
 	if !c.tls {
 		// obfuscation mechanism only applies to non-tls connections
-		// run crypt first before we look for bad secrets
-		if err := crypt(c.secret, &p); err != nil {
-			crypterCryptError.Inc()
-			return nil, err
+		// run crypt first before we look for bad secrets.
+		// with multiple candidate keys, selectSecret de-obfuscates p on a match;
+		// on no match we fall through with the primary key so the bad secret
+		// handling below behaves exactly as it does for a single key.
+		if len(c.candidates) == 0 || !c.selectSecret(&p) {
+			if err := crypt(c.secret, &p); err != nil {
+				crypterCryptError.Inc()
+				return nil, err
+			}
 		}
 		// if err is != nil, we hit a bug
 		// if reply is != nil, we found a bad secret.
@@ -200,6 +226,32 @@ func (c *crypter) read() (*Packet, error) {
 
 	crypterRead.Inc()
 	return &p, nil
+}
+
+// selectSecret trial-decrypts the obfuscated packet p with each candidate key
+// in order and locks the crypter to the first one whose result parses. On a
+// match p.Body is replaced with the de-obfuscated body and true is returned.
+// On no match p is left untouched, candidates are kept, and false is returned.
+//
+// Packets with the unencrypted flag are skipped (false): every key "matches"
+// a body that crypt never touches, so they carry no signal.
+func (c *crypter) selectSecret(p *Packet) bool {
+	if p.Header.Flags.Has(UnencryptedFlag) {
+		return false
+	}
+	for i, k := range c.candidates {
+		trial := Packet{Header: p.Header, Body: slices.Clone(p.Body)}
+		if err := crypt(k, &trial); err != nil {
+			continue
+		}
+		if !isBadSecret(&trial) {
+			c.secret, c.matched, c.candidates = k, i, nil
+			p.Body = trial.Body
+			crypterSecretMatch.WithLabelValues(secretIndexLabel(i)).Inc()
+			return true
+		}
+	}
+	return false
 }
 
 // write takes a packet, marshals and crypts it
@@ -239,10 +291,26 @@ func (c *crypter) write(p *Packet) (int, error) {
 
 // detectBadSecret is "a way" to detect a potential bad secret.  tacacs doesn't give
 // us enough information to know what body to expect from a given header, so we
-// have to go to great lengths to guess
+// have to go to great lengths to guess. A non-nil reply means a bad secret.
 func (c crypter) detectBadSecret(p *Packet) (*Packet, error) {
-	if p.Header.Flags.Has(UnencryptedFlag) {
+	if !isBadSecret(p) {
 		return nil, nil
+	}
+	crypterBadSecret.Inc()
+	return c.badSecretReply(p.Header)
+}
+
+// isBadSecret reports whether a de-obfuscated packet body fails to parse as
+// any body valid for its header type, which most likely means the key used to
+// de-obfuscate it was wrong. It has no side effects, so it is also used to
+// trial candidate keys during rotation; see crypter.selectSecret.
+//
+// This is a heuristic: a wrong key yields pseudo-random bytes, which nearly
+// always break the length fields these bodies carry, but a wrong key can in
+// principle produce a body that parses. Keep candidate key lists short.
+func isBadSecret(p *Packet) bool {
+	if p.Header.Flags.Has(UnencryptedFlag) {
+		return false
 	}
 	switch p.Header.Type {
 	case Authenticate:
@@ -260,9 +328,8 @@ func (c crypter) detectBadSecret(p *Packet) (*Packet, error) {
 			errCnt++
 		}
 		if errCnt == 3 {
-			crypterBadSecret.Inc()
-			// all packet types failed, most likley a bad secret
-			return c.badSecretReply(p.Header)
+			// all packet types failed, most likely a bad secret
+			return true
 		}
 	case Authorize:
 		errCnt := 0
@@ -275,9 +342,8 @@ func (c crypter) detectBadSecret(p *Packet) (*Packet, error) {
 			errCnt++
 		}
 		if errCnt == 2 {
-			crypterBadSecret.Inc()
-			// all packet types failed, most likley a bad secret
-			return c.badSecretReply(p.Header)
+			// all packet types failed, most likely a bad secret
+			return true
 		}
 	case Accounting:
 		errCnt := 0
@@ -290,12 +356,11 @@ func (c crypter) detectBadSecret(p *Packet) (*Packet, error) {
 			errCnt++
 		}
 		if errCnt == 2 {
-			crypterBadSecret.Inc()
-			// all packet types failed, most likley a bad secret
-			return c.badSecretReply(p.Header)
+			// all packet types failed, most likely a bad secret
+			return true
 		}
 	}
-	return nil, nil
+	return false
 }
 
 func (c crypter) unsetFlagReply(h *Header) (*Packet, error) {

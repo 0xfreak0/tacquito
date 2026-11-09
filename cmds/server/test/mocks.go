@@ -49,16 +49,14 @@ type Sequence struct {
 	Validate       func(p *tq.Packet) error
 }
 
-// MockSecretProvider creates a mock secret provider
-func MockSecretProvider(ctx context.Context, logger loggerProvider, configPath string) (tq.SecretProvider, error) {
+// MockSecretProvider creates a mock secret provider. extra options are applied
+// after the defaults, so they can override them (e.g. the keychain provider).
+func MockSecretProvider(ctx context.Context, logger loggerProvider, configPath string, extra ...loader.Option) (tq.SecretProvider, error) {
 	accountingLogger, err := local.New(logger, local.SetLogSinkDefault("/tmp/tacquito_accounting.log", "tacquito"))
 	if err != nil {
 		return nil, fmt.Errorf("error building accounting logger; %v", err)
 	}
-	sp, err := loader.NewLocalConfig(
-		ctx,
-		configPath,
-		yaml.New(),
+	opts := []loader.Option{
 		loader.SetLoggerProvider(logger),
 		loader.SetKeychainProvider(secret.New()),
 		loader.SetConfigProvider(config.New()),
@@ -67,7 +65,8 @@ func MockSecretProvider(ctx context.Context, logger loggerProvider, configPath s
 		loader.RegisterAuthenticator(config.BCRYPT, bcrypt.New(logger, &shh{})),
 		loader.RegisterAccounter(config.FILE, accountingLogger),
 		loader.RegisterHandlerType(config.START, handlers.NewStart(logger)),
-	)
+	}
+	sp, err := loader.NewLocalConfig(ctx, configPath, yaml.New(), append(opts, extra...)...)
 	if err != nil {
 		return nil, err
 	}
